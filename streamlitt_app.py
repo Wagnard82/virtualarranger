@@ -333,8 +333,12 @@ with col_main:
             with st.status("🎼 Inizio lavorazione...", expanded=True) as status:
                 try:
                     # -- 1. CARICAMENTO --
-                    st.write("Lettura del file XML/MXL in corso...")
-                    with tempfile.NamedTemporaryFile(delete=False, suffix=".xml") as tmp_in:
+                    st.write("Lettura del file in corso...")
+                    
+                    # Estrae l'estensione originale (.xml o .mxl) dal file caricato
+                    estensione = os.path.splitext(uploaded_file.name)[1].lower()
+                    
+                    with tempfile.NamedTemporaryFile(delete=False, suffix=estensione) as tmp_in:
                         tmp_in.write(uploaded_file.getvalue())
                         tmp_path = tmp_in.name
                     
