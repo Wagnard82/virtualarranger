@@ -314,7 +314,7 @@ with col_right:
             st.toast("Feedback registrato! Grazie.")
     
     st.markdown("<br>", unsafe_allow_html=True)
-    st.link_button("☕ Offrimi un Caffè su Ko-Fi", "ko-fi.com/wagnard")
+    st.link_button("☕ Offrimi un Caffè su Ko-Fi", "https://ko-fi.com/wagnard")
 
 
 # --- COLONNA CENTRALE (App) ---
