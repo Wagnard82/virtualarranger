@@ -4,11 +4,13 @@ import copy
 from fractions import Fraction
 import tempfile
 import os
+import requests
+import math
 
 # ==========================================
 # CONFIGURAZIONE PAGINA E STILE
 # ==========================================
-st.set_page_config(page_title="Orchestratore Ibrido Pro", layout="wide")
+st.set_page_config(page_title="Orchestratore Ibrido v0.2", layout="wide")
 
 st.markdown("""
     <style>
@@ -19,16 +21,28 @@ st.markdown("""
     """, unsafe_allow_html=True)
 
 # ==========================================
-# FUNZIONI DI SUPPORTO E FISICA STRUMENTALE
+# GLOBALI & LIBRERIA STRUMENTI
 # ==========================================
+# L'ordine classico da partitura: Legni in alto, Archi in basso
+ORDINE_PARTITURA = ["Flauto", "Oboe", "Clarinetto in Sib", "Fagotto", "Violino I", "Violino II", "Viola", "Violoncello"]
 
+LIBRERIA_STRUMENTI = {
+    "Flauto":            {"min": 60, "max": 96, "clef": clef.TrebleClef(), "inst": instrument.Flute()},
+    "Oboe":              {"min": 58, "max": 91, "clef": clef.TrebleClef(), "inst": instrument.Oboe()},
+    "Clarinetto in Sib": {"min": 50, "max": 89, "clef": clef.TrebleClef(), "inst": instrument.Clarinet()}, 
+    "Fagotto":           {"min": 34, "max": 75, "clef": clef.BassClef(),   "inst": instrument.Bassoon()},
+    "Violino I":         {"min": 55, "max": 96, "clef": clef.TrebleClef(), "inst": instrument.Violin()},
+    "Violino II":        {"min": 55, "max": 84, "clef": clef.TrebleClef(), "inst": instrument.Violin()},
+    "Viola":             {"min": 48, "max": 79, "clef": clef.AltoClef(),   "inst": instrument.Viola()},
+    "Violoncello":       {"min": 36, "max": 67, "clef": clef.BassClef(),   "inst": instrument.Violoncello()}
+}
+
+# ==========================================
+# FUNZIONI DI SUPPORTO E FISICA
+# ==========================================
 def get_octave_shift(ps, strumento):
-    min_ps, max_ps = 0, 127
-    if strumento == "Violino I": min_ps, max_ps = 55, 96      
-    elif strumento == "Violino II": min_ps, max_ps = 55, 84   
-    elif strumento == "Viola": min_ps, max_ps = 48, 79         
-    elif strumento == "Violoncello": min_ps, max_ps = 36, 67   
-    
+    min_ps = LIBRERIA_STRUMENTI[strumento]["min"]
+    max_ps = LIBRERIA_STRUMENTI[strumento]["max"]
     shift = 0
     temp_ps = ps
     while temp_ps < min_ps:
@@ -46,21 +60,6 @@ def applica_limiti_fisici(nota_obj, strumento):
         nota_obj.pitch.octave += shift_ottave
     return nota_obj
 
-def calcola_shift_blocco(pitches, strumento):
-    if not pitches: return 0
-    min_ps_strum, max_ps_strum = 0, 127
-    if strumento == "Violino I": min_ps_strum, max_ps_strum = 55, 96      
-    elif strumento == "Violino II": min_ps_strum, max_ps_strum = 55, 84   
-    elif strumento == "Viola": min_ps_strum, max_ps_strum = 48, 79         
-    elif strumento == "Violoncello": min_ps_strum, max_ps_strum = 36, 67 
-    
-    shift = 0
-    min_p = min(pitches)
-    while min_p + shift < min_ps_strum: shift += 12
-    max_p = max(pitches)
-    while max_p + shift > max_ps_strum and (min_p + shift - 12) >= min_ps_strum: shift -= 12
-    return shift
-
 def is_strumento_libero(misura, check_offset):
     for n in misura.notes:
         if getattr(n.duration, 'isGrace', False) or n.quarterLength == 0: continue
@@ -70,40 +69,13 @@ def is_strumento_libero(misura, check_offset):
     return True
 
 def copia_proprieta(sorgente, destinazione):
-    if hasattr(sorgente, 'tie') and sorgente.tie: 
-        destinazione.tie = copy.deepcopy(sorgente.tie)
+    if hasattr(sorgente, 'tie') and sorgente.tie is not None: 
+        destinazione.tie = tie.Tie(sorgente.tie.type)
+        
     if hasattr(sorgente, 'articulations') and sorgente.articulations:
-        nuove_art = []
-        for art in sorgente.articulations:
-            if not isinstance(art, articulations.Fingering):
-                nuove_art.append(copy.deepcopy(art))
-        if nuove_art: destinazione.articulations = nuove_art
-
-def rileva_unisono(m_dx, m_sx):
-    if not m_dx or not m_sx: return False
-    notes_dx = [n for n in m_dx.flatten().notes if n.quarterLength > 0 and not getattr(n.duration, 'isGrace', False)]
-    notes_sx = [n for n in m_sx.flatten().notes if n.quarterLength > 0 and not getattr(n.duration, 'isGrace', False)]
-    if not notes_dx or not notes_sx: return False
-    pc_dx = {}
-    for n in notes_dx:
-        off = float(n.offset)
-        if off not in pc_dx: pc_dx[off] = set()
-        pcs = [p.ps % 12 for p in (n.pitches if hasattr(n, 'pitches') else [n.pitch])]
-        pc_dx[off].update(pcs)
-    pc_sx = {}
-    for n in notes_sx:
-        off = float(n.offset)
-        if off not in pc_sx: pc_sx[off] = set()
-        pcs = [p.ps % 12 for p in (n.pitches if hasattr(n, 'pitches') else [n.pitch])]
-        pc_sx[off].update(pcs)
-    common_offsets = set(pc_dx.keys()).intersection(set(pc_sx.keys()))
-    if len(common_offsets) == 0: return False
-    match_count = sum(1 for off in common_offsets if pc_dx[off].intersection(pc_sx[off]))
-    if match_count / max(len(pc_dx), len(pc_sx)) >= 0.8: return True
-    return False
-
-def is_consecutivo(n1, n2):
-    return abs(float(n2.offset) - float(n1.offset + n1.quarterLength)) < 0.001
+        nuove_art = [copy.deepcopy(art) for art in sorgente.articulations if not isinstance(art, articulations.Fingering)]
+        if nuove_art: 
+            destinazione.articulations = nuove_art
 
 def analizza_misure(m_dx, m_sx):
     if not m_dx or not m_sx: return True, False
@@ -113,75 +85,56 @@ def analizza_misure(m_dx, m_sx):
 
     accordi_dx = sum(1 for n in notes_dx if hasattr(n, 'pitches') and len(n.pitches) > 1)
     accordi_sx = sum(1 for n in notes_sx if hasattr(n, 'pitches') and len(n.pitches) > 1)
+    
     is_dx_melodia = True
     if len(notes_dx) > 0 and (accordi_dx / len(notes_dx)) > 0.5 and accordi_sx == 0:
         is_dx_melodia = False
 
     ps_dx = [p.ps for n in notes_dx for p in (n.pitches if hasattr(n, 'pitches') else [n.pitch])]
     ps_sx = [p.ps for n in notes_sx for p in (n.pitches if hasattr(n, 'pitches') else [n.pitch])]
+    
     avg_dx = sum(ps_dx) / len(ps_dx) if ps_dx else 60
     avg_sx = sum(ps_sx) / len(ps_sx) if ps_sx else 48
 
     is_melodia_bassa = False
-    if is_dx_melodia:
-        if avg_dx < avg_sx: is_melodia_bassa = True
-    else:
-        if avg_sx < avg_dx: is_melodia_bassa = True
+    if is_dx_melodia and avg_dx < avg_sx: is_melodia_bassa = True
+    elif not is_dx_melodia and avg_sx < avg_dx: is_melodia_bassa = True
 
     return is_dx_melodia, is_melodia_bassa
 
+def get_lowest_ps(element):
+    if hasattr(element, 'pitches') and element.pitches: return min(p.ps for p in element.pitches)
+    if hasattr(element, 'pitch'): return element.pitch.ps
+    return 60
+
+# ==========================================
+# MOTORE DEI PATTERN 
+# ==========================================
 def arrangia_pattern_sinistra(tutte_note, cassetti, num, strum_pattern):
-    if not tutte_note: return []
+    if not tutte_note or not strum_pattern: return []
     
-    s_b = strum_pattern[0]
-    s_m = strum_pattern[1]
+    s_b = strum_pattern[0] if len(strum_pattern) > 0 else None
+    s_m = strum_pattern[1] if len(strum_pattern) > 1 else strum_pattern[0]
     s_h = strum_pattern[2] if len(strum_pattern) > 2 else None
     
-    durate_singole = [n.quarterLength for n in tutte_note if isinstance(n, note.Note) and not getattr(n.duration, 'isGrace', False) and n.quarterLength > 0]
-    if not durate_singole: return tutte_note
-    min_dur = min(durate_singole)
+    if not s_b or not s_m: return tutte_note 
     
-    singole_veloci = [n for n in tutte_note if isinstance(n, note.Note) and not getattr(n.duration, 'isGrace', False) and abs(n.quarterLength - min_dur) < 0.001]
-    
-    usate = set()
-    
-    if len(singole_veloci) >= 3:
-        singole_veloci.sort(key=lambda x: float(x.offset))
-        octave_jumps = sum(1 for i in range(len(singole_veloci)-1) if abs(singole_veloci[i].pitch.ps - singole_veloci[i+1].pitch.ps) == 12)
-        
-        if octave_jumps >= len(singole_veloci) // 2 and octave_jumps > 0:
-            low_p = min(n.pitch.ps for n in singole_veloci)
-            high_p = max(n.pitch.ps for n in singole_veloci)
-            
-            low_note_ref = next(n for n in singole_veloci if n.pitch.ps == low_p)
-            high_note_ref = next(n for n in singole_veloci if n.pitch.ps == high_p)
-            
-            for nj in singole_veloci:
-                n_c = copy.deepcopy(low_note_ref); n_c.offset = nj.offset; n_c.duration = copy.deepcopy(nj.duration)
-                copia_proprieta(nj, n_c); n_c = applica_limiti_fisici(n_c, s_b); cassetti[s_b][num].insert(n_c.offset, n_c)
-                
-                n_v = copy.deepcopy(high_note_ref); n_v.offset = nj.offset; n_v.duration = copy.deepcopy(nj.duration)
-                copia_proprieta(nj, n_v); n_v = applica_limiti_fisici(n_v, s_m); cassetti[s_m][num].insert(n_v.offset, n_v)
-                
-                if s_h: 
-                    n_v2 = copy.deepcopy(high_note_ref); n_v2.offset = nj.offset; n_v2.duration = copy.deepcopy(nj.duration)
-                    copia_proprieta(nj, n_v2); n_v2 = applica_limiti_fisici(n_v2, s_h); cassetti[s_h][num].insert(n_v2.offset, n_v2)
-                usate.add(id(nj))
-            
-            return [n for n in tutte_note if id(n) not in usate]
-
     note_by_offset = {}
-    for n in singole_veloci:
-        off = float(n.offset)
-        if off not in note_by_offset: note_by_offset[off] = []
-        note_by_offset[off].append(n)
+    for n in tutte_note:
+        if getattr(n.duration, 'isGrace', False) or n.quarterLength == 0: continue
+        off = Fraction(float(n.offset)).limit_denominator(100)
+        note_by_offset.setdefault(off, []).append(n)
         
     unique_offsets = sorted(note_by_offset.keys())
+    usate = set()
     
     def find_closest(target):
         for off in unique_offsets:
-            if abs(off - target) < 0.001: return off
+            if abs(float(off) - float(target)) < 0.002: return off
         return None
+
+    durate_reali = [n.quarterLength for n in tutte_note if n.quarterLength > 0]
+    min_dur = min(durate_reali) if durate_reali else 0.5
 
     i = 0
     while i < len(unique_offsets):
@@ -190,98 +143,138 @@ def arrangia_pattern_sinistra(tutte_note, cassetti, num, strum_pattern):
         
         for j in range(i+1, min(i+4, len(unique_offsets))):
             dur = unique_offsets[j] - o1
-            if dur <= 0 or dur > 1.0: continue
+            if float(dur) <= 0 or float(dur) > min_dur * 2.0: continue 
             
             o2, o3, o4 = o1 + dur, o1 + 2*dur, o1 + 3*dur
             real_o2, real_o3, real_o4 = find_closest(o2), find_closest(o3), find_closest(o4)
             
             if real_o2 is not None and real_o3 is not None and real_o4 is not None:
-                n1 = min(note_by_offset[o1], key=lambda x: x.pitch.ps)
-                n2 = min(note_by_offset[real_o2], key=lambda x: x.pitch.ps)
-                n3 = min(note_by_offset[real_o3], key=lambda x: x.pitch.ps)
-                n4 = min(note_by_offset[real_o4], key=lambda x: x.pitch.ps)
+                n1 = min(note_by_offset[o1], key=get_lowest_ps)
+                n2 = min(note_by_offset[real_o2], key=get_lowest_ps)
+                n3 = min(note_by_offset[real_o3], key=get_lowest_ps)
+                n4 = min(note_by_offset[real_o4], key=get_lowest_ps)
                 
-                p1, p2, p3, p4 = n1.pitch.ps, n2.pitch.ps, n3.pitch.ps, n4.pitch.ps
+                p1, p2, p3, p4 = get_lowest_ps(n1), get_lowest_ps(n2), get_lowest_ps(n3), get_lowest_ps(n4)
                 
                 is_alberti = (p1 < p3 and p3 < p2 and p2 == p4)
                 is_tremolo = (p2 == p4 and p1 < p2 and p3 < p4 and not is_alberti)
                 is_arpeggio = (p1 < p2 and p2 < p3 and p3 < p4)
+                is_ottave = (abs(p1 - p2) == 12 and p1 == p3 and p2 == p4)
                 
-                if is_alberti or is_tremolo or is_arpeggio:
-                    if is_alberti:
-                        n_cello = copy.deepcopy(n1)
-                        n_cello = applica_limiti_fisici(n_cello, s_b)
-                        cassetti[s_b][num].insert(o1, n_cello)
-                        usate.add(id(n1))
-                        
-                        for nj, real_off in zip([n2, n3, n4], [real_o2, real_o3, real_o4]):
-                            n_viola = copy.deepcopy(nj); n_viola.quarterLength = dur; n_viola.pitch = copy.deepcopy(n3.pitch) 
-                            n_viola = applica_limiti_fisici(n_viola, s_m); cassetti[s_m][num].insert(real_off, n_viola)
+                if is_ottave or is_alberti or is_tremolo or is_arpeggio:
+                    if is_ottave:
+                        low_p, high_p = min(p1, p2), max(p1, p2)
+                        for nj, real_off in zip([n1, n2, n3, n4], [o1, real_o2, real_o3, real_o4]):
+                            n_c = copy.deepcopy(nj); n_c.pitch.ps = low_p
+                            cassetti[s_b][num].insert(float(real_off), applica_limiti_fisici(n_c, s_b))
+                            if s_m != s_b:
+                                n_v = copy.deepcopy(nj); n_v.pitch.ps = high_p
+                                cassetti[s_m][num].insert(float(real_off), applica_limiti_fisici(n_v, s_m))
+                            if s_h: 
+                                n_v2 = copy.deepcopy(nj); n_v2.pitch.ps = high_p
+                                cassetti[s_h][num].insert(float(real_off), applica_limiti_fisici(n_v2, s_h))
+                            usate.add(id(nj))
                             
+                    elif is_alberti:
+                        cassetti[s_b][num].insert(float(o1), applica_limiti_fisici(copy.deepcopy(n1), s_b))
+                        usate.add(id(n1))
+                        for nj, real_off in zip([n2, n3, n4], [real_o2, real_o3, real_o4]):
+                            if s_m != s_b:
+                                n_viola = copy.deepcopy(nj); n_viola.pitch.ps = p3
+                                cassetti[s_m][num].insert(float(real_off), applica_limiti_fisici(n_viola, s_m))
                             if s_h:
-                                n_vln2 = copy.deepcopy(nj); n_vln2.quarterLength = dur; n_vln2.pitch = copy.deepcopy(n2.pitch) 
-                                n_vln2 = applica_limiti_fisici(n_vln2, s_h); cassetti[s_h][num].insert(real_off, n_vln2)
+                                n_vln2 = copy.deepcopy(nj); n_vln2.pitch.ps = p2
+                                cassetti[s_h][num].insert(float(real_off), applica_limiti_fisici(n_vln2, s_h))
                             usate.add(id(nj))
                             
                     elif is_tremolo:
-                        durata_doppia = dur * 2 
-                        n_c1 = copy.deepcopy(n1); n_c1.quarterLength = durata_doppia; n_c1 = applica_limiti_fisici(n_c1, s_b); cassetti[s_b][num].insert(o1, n_c1)
-                        n_c2 = copy.deepcopy(n3); n_c2.quarterLength = durata_doppia; n_c2 = applica_limiti_fisici(n_c2, s_b); cassetti[s_b][num].insert(real_o3, n_c2)
+                        durata_doppia = Fraction(float(dur * 2)).limit_denominator(100)
+                        
+                        n_c1 = copy.deepcopy(n1); n_c1.duration.quarterLength = durata_doppia
+                        cassetti[s_b][num].insert(float(o1), applica_limiti_fisici(n_c1, s_b))
+                        
+                        n_c2 = copy.deepcopy(n3); n_c2.duration.quarterLength = durata_doppia
+                        cassetti[s_b][num].insert(float(real_o3), applica_limiti_fisici(n_c2, s_b))
                         
                         if s_h:
-                            n_v1 = copy.deepcopy(n1); n_v1.quarterLength = durata_doppia; n_v1 = applica_limiti_fisici(n_v1, s_m); cassetti[s_m][num].insert(o1, n_v1)
-                            n_v2 = copy.deepcopy(n3); n_v2.quarterLength = durata_doppia; n_v2 = applica_limiti_fisici(n_v2, s_m); cassetti[s_m][num].insert(real_o3, n_v2)
-                            shift_vln2 = calcola_shift_blocco([p1, p2, p3, p4], s_h)
+                            n_v1 = copy.deepcopy(n1); n_v1.duration.quarterLength = durata_doppia
+                            cassetti[s_m][num].insert(float(o1), applica_limiti_fisici(n_v1, s_m))
+                            n_v2 = copy.deepcopy(n3); n_v2.duration.quarterLength = durata_doppia
+                            cassetti[s_m][num].insert(float(real_o3), applica_limiti_fisici(n_v2, s_m))
                             for nj, real_off in zip([n1, n2, n3, n4], [o1, real_o2, real_o3, real_o4]):
-                                n_vln2 = copy.deepcopy(nj); n_vln2.quarterLength = dur; n_vln2.pitch.octave += (shift_vln2 // 12)
-                                cassetti[s_h][num].insert(real_off, n_vln2)
+                                cassetti[s_h][num].insert(float(real_off), applica_limiti_fisici(copy.deepcopy(nj), s_h))
                                 usate.add(id(nj))
-                        else:
-                            shift_vla = calcola_shift_blocco([p1, p2, p3, p4], s_m)
+                        elif s_m != s_b:
                             for nj, real_off in zip([n1, n2, n3, n4], [o1, real_o2, real_o3, real_o4]):
-                                n_vla = copy.deepcopy(nj); n_vla.quarterLength = dur; n_vla.pitch.octave += (shift_vla // 12)
-                                cassetti[s_m][num].insert(real_off, n_vla)
+                                cassetti[s_m][num].insert(float(real_off), applica_limiti_fisici(copy.deepcopy(nj), s_m))
                                 usate.add(id(nj))
                             
                     elif is_arpeggio:
-                        n_basso = copy.deepcopy(n1)
-                        n_basso = applica_limiti_fisici(n_basso, s_b)
-                        cassetti[s_b][num].insert(o1, n_basso)
+                        cassetti[s_b][num].insert(float(o1), applica_limiti_fisici(copy.deepcopy(n1), s_b))
                         usate.add(id(n1))
-                        
-                        note_per_cello, note_per_alti = [], []
-                        for nj in [n2, n3, n4]:
-                            if nj.pitch.ps < 48: note_per_cello.append(nj)
-                            else: note_per_alti.append(nj)
-                        
                         for nj, real_off in zip([n2, n3, n4], [real_o2, real_o3, real_o4]):
-                            if nj in note_per_cello:
-                                n_c = copy.deepcopy(nj); n_c.quarterLength = dur
-                                n_c = applica_limiti_fisici(n_c, s_b)
-                                cassetti[s_b][num].insert(real_off, n_c)
-                                usate.add(id(nj))
-                            else:
-                                shift_vla = calcola_shift_blocco([n.pitch.ps for n in note_per_alti], s_m)
-                                n_vla = copy.deepcopy(nj); n_vla.quarterLength = dur; n_vla.pitch.octave += (shift_vla // 12)
-                                cassetti[s_m][num].insert(real_off, n_vla)
-                                
+                            ps_j = get_lowest_ps(nj)
+                            if ps_j < 48:
+                                cassetti[s_b][num].insert(float(real_off), applica_limiti_fisici(copy.deepcopy(nj), s_b))
+                            elif s_m != s_b:
+                                cassetti[s_m][num].insert(float(real_off), applica_limiti_fisici(copy.deepcopy(nj), s_m))
                                 if s_h:
-                                    shift_vln2 = calcola_shift_blocco([n.pitch.ps for n in note_per_alti], s_h)
-                                    n_vln2 = copy.deepcopy(nj); n_vln2.quarterLength = dur; n_vln2.pitch.octave += (shift_vln2 // 12)
-                                    cassetti[s_h][num].insert(real_off, n_vln2)
-                                usate.add(id(nj))
+                                    cassetti[s_h][num].insert(float(real_off), applica_limiti_fisici(copy.deepcopy(nj), s_h))
+                            usate.add(id(nj))
                     
                     pattern_found = True
                     break 
             
         if pattern_found:
-            idx4 = unique_offsets.index(real_o4)
-            i = idx4 + 1
+            i = unique_offsets.index(real_o4) + 1
         else:
             i += 1
             
-    note_rimaste = [n for n in tutte_note if id(n) not in usate]
-    return note_rimaste
+    return [n for n in tutte_note if id(n) not in usate]
+
+def applica_dinamiche_e_testi(m_sorgente, m_destinazione):
+    if not m_sorgente: return
+    elementi_dinamici = m_sorgente.getElementsByClass(['Dynamic', 'TextExpression'])
+    for elemento in elementi_dinamici:
+        esistenti = list(m_destinazione.getElementsByClass(type(elemento)).getElementsByOffset(elemento.offset))
+        if not esistenti:
+            m_destinazione.insert(elemento.offset, copy.deepcopy(elemento))
+
+def calcola_ruoli_dinamici(ensemble, configurazione_attuale):
+    if not ensemble: return
+    n = len(ensemble)
+    
+    for s in ensemble:
+        configurazione_attuale[s]["ruolo"] = "Accompagnamento"
+        
+    if n == 1:
+        configurazione_attuale[ensemble[0]]["ruolo"] = "Melodia"
+        return
+        
+    priorita_melodia = ["Violino I", "Flauto", "Oboe", "Violino II", "Clarinetto in Sib", "Viola", "Violoncello", "Fagotto"]
+    priorita_basso = ["Violoncello", "Fagotto", "Viola", "Clarinetto in Sib", "Violino II", "Oboe", "Flauto", "Violino I"]
+    
+    melodie_candidate = [s for s in priorita_melodia if s in ensemble]
+    bassi_candidati = [s for s in priorita_basso if s in ensemble]
+    
+    num_melodie = 2 if n >= 5 else 1
+    num_bassi = 2 if n >= 6 else 1
+    
+    assegnati = set()
+    
+    for i in range(min(num_melodie, len(melodie_candidate))):
+        s = melodie_candidate[i]
+        configurazione_attuale[s]["ruolo"] = "Melodia"
+        assegnati.add(s)
+        
+    bassi_assegnati = 0
+    for s in bassi_candidati:
+        if s not in assegnati or n == 2:
+            configurazione_attuale[s]["ruolo"] = "Basso"
+            assegnati.add(s)
+            bassi_assegnati += 1
+        if bassi_assegnati >= num_bassi:
+            break
 
 # ==========================================
 # LAYOUT STREAMLIT PRINCIPALE
@@ -291,53 +284,101 @@ col_main, col_right = st.columns([7, 3], gap="large")
 
 # --- COLONNA DESTRA (Spiegazioni) ---
 with col_right:
-    st.header("📖 Come Funziona")
-    st.info("Motore Ibrido v3: **Polifonia Perfetta & Spazzatrice**")
+    st.info("✨ **Versione 0.2: L'Orchestra Modulare**")
     
+    # SEZIONE NOVITA' (CHANGELOG)
     st.markdown("""
-    Questo strumento trasforma il pianoforte in quartetto d'archi usando **regole musicali e fisiche**:
-    
-    * **Priorità Melodia:** Il 'Sarto' identifica le voci principali e protegge le linee melodiche dagli incastri.
-    * **Detector Unisono:** Riconosce i raddoppi percussivi e li orchestra per l'intero quartetto.
-    * **Filtro Polifonico:** Preserva i 'Double Stops' ma non spezza le legature lunghe.
-    * **Spazzatrice Assoluta:** Rimuove i fastidiosi avvisi di *4/4* ripetuti o *cambi chiave* invisibili nelle misure interne del file esportato, garantendo un rendering pulito.
+    **Novità in questo aggiornamento:**
+    * 🎛️ **Pannello di Selezione:** Ora puoi scegliere interattivamente quali Legni e Archi includere.
+    * 🧠 **Ruoli Dinamici:** Il motore assegna in automatico *Melodia*, *Basso* e *Accompagnamento* in base agli strumenti scelti.
+    * 🎻 **Raddoppi Intelligenti:** Se selezioni molti strumenti, i principali si raddoppiano per dare più corpo al suono (es. Flauto copia Violino I).
+    * 🛡️ **Frazioni Blindate:** Usa la libreria `fractions` per calcoli temporali perfetti, evitando crash e disallineamenti ritmici.
+    * 🧹 **Spazzatrice Assoluta:** Pulisce automaticamente l'export da cambi di tempo e chiave inutili in mezzo alla partitura.
     """)
 
-    
+    st.divider()
+
+    st.header("📖 Come Funziona")
+    st.markdown("""
+    L'algoritmo analizza la polifonia del pianoforte e la redistribuisce fisicamente sugli strumenti reali. 
+    Seleziona la tua formazione, carica il file e lascia che l'Intelligenza Artificiale "classica" gestisca pattern ritmici (Alberti, arpeggi) ed estensioni vocali.
+    """)
 
     st.divider()
     st.subheader("💬 Feedback & Supporto")
     with st.form("feedback"):
         st.write("Aiutami a migliorare l'algoritmo!")
         commento = st.text_area("Suggerimenti o bug trovati:")
-        if st.form_submit_button("Invia Feedback"):
-            st.toast("Feedback registrato! Grazie.")
+        inviato = st.form_submit_button("Invia Feedback")
+        
+        if inviato:
+            if commento.strip() == "":
+                st.warning("Scrivi qualcosa prima di inviare!")
+            else:
+                try:
+                    BOT_TOKEN = st.secrets["TELEGRAM_TOKEN"] 
+                    CHAT_ID = st.secrets["TELEGRAM_CHAT_ID"]
+                    messaggio = f"🎵 *Nuovo Feedback v0.2*\n\n{commento}"
+                    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+                    payload = {"chat_id": CHAT_ID, "text": messaggio, "parse_mode": "Markdown"}
+                    requests.post(url, json=payload)
+                    st.success("Feedback inviato con successo! Grazie.")
+                except Exception:
+                    st.success("Feedback registrato (modalità offline).")
     
     st.markdown("<br>", unsafe_allow_html=True)
-    st.link_button("☕ Offrimi un Caffè su Ko-Fi", "https://ko-fi.com/wagnard")
-
+    st.link_button("☕ Offrimi un Caffè su Ko-Fi", "https://ko-fi.com/tuo_profilo")
 
 # --- COLONNA CENTRALE (App) ---
 with col_main:
-    st.title("🎻 Orchestratore Ibrido Definitivo")
-    st.write("Carica un file **MusicXML (.mxl / .xml)**. Il motore arrangerà automaticamente il brano per Quartetto D'Archi.")
+    st.title("🎼 Orchestratore Modulare v0.2")
+    st.write("Carica un brano per pianoforte e orchestra la tua formazione personalizzata di Legni e Archi.")
     
-    uploaded_file = st.file_uploader("Seleziona il tuo spartito", type=['mxl', 'xml'])
+    uploaded_file = st.file_uploader("Seleziona il tuo spartito (.mxl / .xml)", type=['mxl', 'xml'])
     
-    with st.expander("⚙️ Parametri Avanzati (Il Sarto)"):
-        ENABLE_DOUBLE_STOPS = st.checkbox("Abilita Double Stops (Corde doppie per strumenti singoli)", value=True)
+    # -- PANNELLO DI CONTROLLO UTENTE --
+    with st.expander("🎻 Componi la tua Orchestra", expanded=True):
+        st.write("Seleziona gli strumenti attivi per l'orchestrazione:")
+        
+        col_legni, col_archi = st.columns(2)
+        
+        user_config = {s: {"attivo": False, "ruolo": "Accompagnamento"} for s in ORDINE_PARTITURA}
+        
+        with col_legni:
+            st.markdown("**🌬️ Legni**")
+            user_config["Flauto"]["attivo"] = st.checkbox("Flauto", value=False)
+            user_config["Oboe"]["attivo"] = st.checkbox("Oboe", value=False)
+            user_config["Clarinetto in Sib"]["attivo"] = st.checkbox("Clarinetto in Sib", value=False)
+            user_config["Fagotto"]["attivo"] = st.checkbox("Fagotto", value=False)
+            
+        with col_archi:
+            st.markdown("**🎻 Archi**")
+            user_config["Violino I"]["attivo"] = st.checkbox("Violino I", value=True)
+            user_config["Violino II"]["attivo"] = st.checkbox("Violino II", value=True)
+            user_config["Viola"]["attivo"] = st.checkbox("Viola", value=True)
+            user_config["Violoncello"]["attivo"] = st.checkbox("Violoncello", value=True)
+            
+        st.divider()
         KEEP_ORIGINAL = st.checkbox("Includi pianoforte originale (Modalità Sicura) nel file esportato", value=True)
 
+    ensemble_attivo = [s for s in ORDINE_PARTITURA if user_config[s]["attivo"]]
+
     if uploaded_file is not None:
-        if st.button("🚀 Avvia Orchestrazione"):
+        if len(ensemble_attivo) == 0:
+            st.warning("⚠️ Seleziona almeno uno strumento per procedere.")
+        elif st.button("🚀 Avvia Orchestrazione"):
             with st.status("🎼 Inizio lavorazione...", expanded=True) as status:
                 try:
-                    # -- 1. CARICAMENTO --
+                    # 0. Calcolo Ruoli
+                    calcola_ruoli_dinamici(ensemble_attivo, user_config)
+                    
+                    st.write("Formazione configurata:")
+                    for s in ensemble_attivo:
+                        st.write(f"- {s} ({user_config[s]['ruolo']})")
+
+                    # 1. Caricamento
                     st.write("Lettura del file in corso...")
-                    
-                    # Estrae l'estensione originale (.xml o .mxl) dal file caricato
                     estensione = os.path.splitext(uploaded_file.name)[1].lower()
-                    
                     with tempfile.NamedTemporaryFile(delete=False, suffix=estensione) as tmp_in:
                         tmp_in.write(uploaded_file.getvalue())
                         tmp_path = tmp_in.name
@@ -347,75 +388,41 @@ with col_main:
                     misure_destra = list(parti_orig[0].getElementsByClass(stream.Measure))
                     misure_sinistra = list(parti_orig[1].getElementsByClass(stream.Measure))
 
-                    # -- 2. ESTRAZIONE E ORCHESTRAZIONE --
-                    st.write("Analisi polifonica ed estrazione dei pattern...")
-                    cassetti = {"Violino I": {}, "Violino II": {}, "Viola": {}, "Violoncello": {}}
+                    # 2. Orchestrazione
+                    st.write("Analisi ed estrazione delle parti...")
+                    cassetti = {strum: {} for strum in ensemble_attivo}
 
                     for m_dx_orig, m_sx_orig in zip(misure_destra, misure_sinistra):
                         num = m_dx_orig.number
                         for strum in cassetti: cassetti[strum][num] = stream.Measure(number=num)
                         
-                        if rileva_unisono(m_dx_orig, m_sx_orig):
-                            for el in m_dx_orig.flatten().getElementsByClass(['Note', 'Chord']):
-                                altezze = sorted(el.pitches) if hasattr(el, 'pitches') and el.pitches else []
-                                if not altezze and hasattr(el, 'pitch'): altezze = [el.pitch]
-                                if not altezze: continue 
-                                    
-                                p_top = altezze[-1]
-                                distribuzione = [("Violino I", 0), ("Violino II", -1), ("Viola", -2), ("Violoncello", -3)]
-                                for strum, shift_ottava in distribuzione:
-                                    n_tutti = note.Note(p_top.nameWithOctave)
-                                    n_tutti.duration = copy.deepcopy(el.duration)
-                                    n_tutti.pitch.octave += shift_ottava
-                                    copia_proprieta(el, n_tutti)
-                                    n_tutti = applica_limiti_fisici(n_tutti, strum)
-                                    cassetti[strum][num].insert(el.offset, n_tutti)
-                            continue 
-                            
                         is_dx_melodia, is_melodia_bassa = analizza_misure(m_dx_orig, m_sx_orig)
-                        
                         fonte_melodia = m_dx_orig if is_dx_melodia else m_sx_orig
                         fonte_accomp = m_sx_orig if is_dx_melodia else m_dx_orig
                         
+                        strum_melodia = [s for s in ensemble_attivo if user_config[s]["ruolo"] == "Melodia"]
+                        strum_accomp  = [s for s in ensemble_attivo if user_config[s]["ruolo"] == "Accompagnamento"]
+                        strum_basso   = [s for s in ensemble_attivo if user_config[s]["ruolo"] == "Basso"]
+
                         if is_melodia_bassa:
-                            strum_melodia = "Violoncello"
-                            s_bass, s_mid, s_hi = "Viola", "Violino II", "Violino I"
-                        else:
-                            strum_melodia = "Violino I"
-                            s_bass, s_mid, s_hi = "Violoncello", "Viola", "Violino II"
-                            
+                            strum_melodia, strum_basso = strum_basso, strum_melodia
+                            strum_accomp = strum_melodia + strum_accomp
+
                         info_offset = {}
                         
-                        # 1. ESTRAZIONE MELODIA Principale
+                        # --- ESTRAZIONE MELODIA ---
                         if fonte_melodia:
                             offset_dict = {}
-                            note_abbellimento = []
                             for el in fonte_melodia.flatten().getElementsByClass(['Note', 'Chord']):
-                                if getattr(el.duration, 'isGrace', False) or el.quarterLength == 0: note_abbellimento.append(el)
-                                else:
-                                    off = float(el.offset)
-                                    if off not in offset_dict: offset_dict[off] = []
-                                    offset_dict[off].append(el)
+                                if not getattr(el.duration, 'isGrace', False) and el.quarterLength > 0:
+                                    offset_dict.setdefault(float(el.offset), []).append(el)
                                     
-                            for el_grace in note_abbellimento:
-                                altezze = sorted(el_grace.pitches) if hasattr(el_grace, 'pitches') and el_grace.pitches else []
-                                if not altezze and hasattr(el_grace, 'pitch'): altezze = [el_grace.pitch]
-                                if not altezze: continue 
-                                p_top = altezze[0] if is_melodia_bassa else altezze[-1]
-                                nota_grace = note.Note(p_top.nameWithOctave)
-                                nota_grace.duration = copy.deepcopy(el_grace.duration) 
-                                copia_proprieta(el_grace, nota_grace)
-                                nota_grace = applica_limiti_fisici(nota_grace, strum_melodia)
-                                cassetti[strum_melodia][num].insert(el_grace.offset, nota_grace)
-                                
                             melody_busy_until = -1.0 
                             for off in sorted(offset_dict.keys()):
-                                if off not in info_offset: info_offset[off] = {'melodia': None, 'basso': None, 'scarti': []}
-                                elementi_qui = offset_dict[off]
+                                info_offset.setdefault(off, {'melodia': None, 'basso': None, 'scarti': []})
                                 pitches_qui = []
-                                for el in elementi_qui:
-                                    altezze = sorted(el.pitches) if hasattr(el, 'pitches') and el.pitches else []
-                                    if not altezze and hasattr(el, 'pitch'): altezze = [el.pitch]
+                                for el in offset_dict[off]:
+                                    altezze = sorted(el.pitches) if hasattr(el, 'pitches') and el.pitches else [el.pitch] if hasattr(el, 'pitch') else []
                                     for p in altezze: pitches_qui.append((p, el))
                                 
                                 if not pitches_qui: continue 
@@ -423,23 +430,17 @@ with col_main:
                                 
                                 if off >= melody_busy_until - 0.001:
                                     p_top, el_top = pitches_qui[0]
-                                    nota_mel = note.Note(p_top.nameWithOctave) 
-                                    nota_mel.duration = copy.deepcopy(el_top.duration)
-                                    copia_proprieta(el_top, nota_mel)
-                                    nota_mel = applica_limiti_fisici(nota_mel, strum_melodia)
-                                    cassetti[strum_melodia][num].insert(off, nota_mel)
+                                    for s_mel in strum_melodia:
+                                        nota_mel = note.Note(p_top.nameWithOctave) 
+                                        nota_mel.duration = copy.deepcopy(el_top.duration)
+                                        copia_proprieta(el_top, nota_mel)
+                                        cassetti[s_mel][num].insert(off, applica_limiti_fisici(nota_mel, s_mel))
+                                        
                                     melody_busy_until = off + el_top.quarterLength
                                     info_offset[off]['melodia'] = p_top.ps
                                     
                                     for p, el_orig in pitches_qui[1:]:
-                                        if p.ps % 12 == p_top.ps % 12: 
-                                            strum_raddoppio = s_bass if is_melodia_bassa else s_hi
-                                            nota_doub = note.Note(p.nameWithOctave)
-                                            nota_doub.duration = copy.deepcopy(el_orig.duration)
-                                            copia_proprieta(el_orig, nota_doub)
-                                            nota_doub = applica_limiti_fisici(nota_doub, strum_raddoppio)
-                                            cassetti[strum_raddoppio][num].insert(off, nota_doub)
-                                            continue 
+                                        if p.ps % 12 == p_top.ps % 12: continue 
                                         sc = note.Note(p.nameWithOctave) 
                                         sc.duration = copy.deepcopy(el_orig.duration)
                                         copia_proprieta(el_orig, sc)
@@ -451,7 +452,7 @@ with col_main:
                                         copia_proprieta(el_orig, sc)
                                         info_offset[off]['scarti'].append(sc)
 
-                        # 2. ESTRAZIONE VOCI E ACCOMPAGNAMENTO
+                        # --- ESTRAZIONE VOCI E ACCOMPAGNAMENTO ---
                         if fonte_accomp:
                             tutte_note_acc = list(fonte_accomp.flatten().notes)
                             durate = [n.quarterLength for n in tutte_note_acc if not getattr(n.duration, 'isGrace', False) and n.quarterLength > 0]
@@ -460,233 +461,171 @@ with col_main:
                             ci_sono_scarti_melodia = any(len(v['scarti']) > 0 for v in info_offset.values())
                             voci_indipendenti = [n for n in tutte_note_acc if not getattr(n.duration, 'isGrace', False) and n.quarterLength >= min_dur * 2.0]
                             
-                            strum_pattern = [s_bass, s_mid, s_hi]
-                            if voci_indipendenti or ci_sono_scarti_melodia:
-                                strum_pattern = [s_bass, s_mid] 
+                            pat_basso = strum_basso[0] if strum_basso else None
+                            pat_accomp = strum_accomp.copy()
+                            if not pat_accomp and "Clarinetto in Sib" in strum_accomp:
+                                pat_accomp = ["Clarinetto in Sib"]
+                                
+                            strum_pattern = []
+                            if pat_basso: strum_pattern.append(pat_basso)
+                            if pat_accomp: strum_pattern.extend(pat_accomp[::-1]) 
+                            
+                            if (voci_indipendenti or ci_sono_scarti_melodia) and len(strum_pattern) > 2:
+                                strum_pattern = strum_pattern[:-1] 
                                 
                             note_accomp_restanti = arrangia_pattern_sinistra(tutte_note_acc, cassetti, num, strum_pattern)
                             
                             offset_dict_acc = {}
-                            grace_acc = []
                             for el in note_accomp_restanti:
-                                if getattr(el.duration, 'isGrace', False) or el.quarterLength == 0: grace_acc.append(el); continue
-                                off = float(el.offset)
-                                if off not in offset_dict_acc: offset_dict_acc[off] = []
-                                offset_dict_acc[off].append(el)
+                                if not getattr(el.duration, 'isGrace', False) and el.quarterLength > 0:
+                                    offset_dict_acc.setdefault(float(el.offset), []).append(el)
                                 
-                            strum_accomp_principale = s_hi if is_melodia_bassa else s_bass
-                            
-                            for el_grace in grace_acc:
-                                 altezze = sorted(el_grace.pitches) if hasattr(el_grace, 'pitches') and el_grace.pitches else []
-                                 if not altezze and hasattr(el_grace, 'pitch'): altezze = [el_grace.pitch]
-                                 if not altezze: continue 
-                                 p_prin = altezze[-1] if is_melodia_bassa else altezze[0]
-                                 nota_grace = note.Note(p_prin.nameWithOctave)
-                                 nota_grace.duration = copy.deepcopy(el_grace.duration)
-                                 copia_proprieta(el_grace, nota_grace)
-                                 nota_grace = applica_limiti_fisici(nota_grace, strum_accomp_principale)
-                                 cassetti[strum_accomp_principale][num].insert(el_grace.offset, nota_grace)
+                            strum_accomp_principale = pat_basso if pat_basso else (pat_accomp[0] if pat_accomp else None)
                                  
                             accomp_busy_until = -1.0
                             for off in sorted(offset_dict_acc.keys()):
-                                if off not in info_offset: info_offset[off] = {'melodia': None, 'basso': None, 'scarti': []}
-                                elementi_qui = offset_dict_acc[off]
+                                info_offset.setdefault(off, {'melodia': None, 'basso': None, 'scarti': []})
                                 pitches_qui = []
-                                for el in elementi_qui:
-                                    altezze = sorted(el.pitches) if hasattr(el, 'pitches') and el.pitches else []
-                                    if not altezze and hasattr(el, 'pitch'): altezze = [el.pitch]
+                                for el in offset_dict_acc[off]:
+                                    altezze = sorted(el.pitches) if hasattr(el, 'pitches') and el.pitches else [el.pitch] if hasattr(el, 'pitch') else []
                                     for p in altezze: pitches_qui.append((p, el))
                                 
                                 if not pitches_qui: continue 
                                 pitches_qui.sort(key=lambda x: x[0].ps, reverse=is_melodia_bassa) 
                                 
-                                if off >= accomp_busy_until - 0.001 and is_strumento_libero(cassetti[strum_accomp_principale][num], off):
+                                if strum_accomp_principale and off >= accomp_busy_until - 0.001 and is_strumento_libero(cassetti[strum_accomp_principale][num], off):
                                     p_prin, el_prin = pitches_qui[0]
                                     nota_acc = note.Note(p_prin.nameWithOctave) 
                                     nota_acc.duration = copy.deepcopy(el_prin.duration)
                                     copia_proprieta(el_prin, nota_acc)
-                                    nota_acc = applica_limiti_fisici(nota_acc, strum_accomp_principale)
-                                    cassetti[strum_accomp_principale][num].insert(off, nota_acc)
+                                    cassetti[strum_accomp_principale][num].insert(off, applica_limiti_fisici(nota_acc, strum_accomp_principale))
                                     accomp_busy_until = off + el_prin.quarterLength
-                                    info_offset[off]['basso'] = p_prin.ps
                                     
                                     for p, el_orig in pitches_qui[1:]:
-                                        sc = note.Note(p.nameWithOctave) 
-                                        sc.duration = copy.deepcopy(el_orig.duration)
-                                        copia_proprieta(el_orig, sc)
-                                        info_offset[off]['scarti'].append(sc)
+                                        sc = note.Note(p.nameWithOctave); sc.duration = copy.deepcopy(el_orig.duration)
+                                        copia_proprieta(el_orig, sc); info_offset[off]['scarti'].append(sc)
                                 else:
                                     for p, el_orig in pitches_qui:
-                                        sc = note.Note(p.nameWithOctave) 
-                                        sc.duration = copy.deepcopy(el_orig.duration)
-                                        copia_proprieta(el_orig, sc)
-                                        info_offset[off]['scarti'].append(sc)
+                                        sc = note.Note(p.nameWithOctave); sc.duration = copy.deepcopy(el_orig.duration)
+                                        copia_proprieta(el_orig, sc); info_offset[off]['scarti'].append(sc)
 
-                        # 3. IL SARTO
+                        # --- IL SARTO ---
                         for off in sorted(info_offset.keys()):
-                            dati = info_offset[off]
-                            lista_note = dati['scarti']
+                            lista_note = info_offset[off]['scarti']
                             if not lista_note: continue
                             
                             lista_note.sort(key=lambda x: x.pitch.ps, reverse=True)
                             
-                            strum_accomp_disponibili = [s_hi, s_mid, s_bass]
-                            liberi_reali = [s for s in strum_accomp_disponibili if is_strumento_libero(cassetti[s][num], off)]
+                            strumenti_riempimento = [s for s in strum_accomp if s in cassetti and is_strumento_libero(cassetti[s][num], off)]
                                     
-                            if not liberi_reali: continue 
+                            if not strumenti_riempimento: continue 
                                 
-                            if len(lista_note) == 1:
-                                nota_da_raddoppiare = lista_note[0]
-                                for target in liberi_reali:
-                                    sc_fixed = copy.deepcopy(nota_da_raddoppiare) 
-                                    sc_fixed = applica_limiti_fisici(sc_fixed, target)
-                                    cassetti[target][num].insert(off, sc_fixed)
-                            else:
-                                if not ENABLE_DOUBLE_STOPS:
-                                    for i, sc in enumerate(lista_note):
-                                        if i < len(liberi_reali): 
-                                            target = liberi_reali[i]
-                                            sc_fixed = copy.deepcopy(sc)
-                                            sc_fixed = applica_limiti_fisici(sc_fixed, target)
-                                            cassetti[target][num].insert(off, sc_fixed)
-                                else:
-                                    assegnazioni = {strum: [] for strum in liberi_reali}
-                                    note_disponibili = lista_note.copy()
+                            for i, strum in enumerate(strumenti_riempimento):
+                                idx_nota = i % len(lista_note)
+                                nota_scelta = copy.deepcopy(lista_note[idx_nota])
+                                nota_fixed = applica_limiti_fisici(nota_scelta, strum)
+                                cassetti[strum][num].insert(float(off), nota_fixed)
 
-                                    for strum in liberi_reali:
-                                        if not note_disponibili: break
-                                        nota_1 = note_disponibili.pop(0)
-                                        nota_1_fixed = copy.deepcopy(nota_1)
-                                        nota_1_fixed = applica_limiti_fisici(nota_1_fixed, strum)
-                                        assegnazioni[strum].append(nota_1_fixed)
-                                        
-                                        if len(note_disponibili) > len(liberi_reali) - liberi_reali.index(strum) - 1:
-                                            partner_idx = -1
-                                            for i, nota_2 in enumerate(note_disponibili):
-                                                nota_2_test = copy.deepcopy(nota_2)
-                                                nota_2_test = applica_limiti_fisici(nota_2_test, strum)
-                                                intervallo = abs(nota_1_fixed.pitch.ps - nota_2_test.pitch.ps)
-                                                if 3 <= intervallo <= 12:
-                                                    partner_idx = i
-                                                    break
-                                            
-                                            if partner_idx != -1:
-                                                nota_2 = note_disponibili.pop(partner_idx)
-                                                nota_2_fixed = copy.deepcopy(nota_2)
-                                                nota_2_fixed = applica_limiti_fisici(nota_2_fixed, strum)
-                                                assegnazioni[strum].append(nota_2_fixed)
+                        # --- RADDOPPI E DINAMICHE ---
+                        def forza_monofonia(n_originale):
+                            n_new = note.Note(min(n_originale.pitches)) if isinstance(n_originale, chord.Chord) else copy.deepcopy(n_originale)
+                            n_new.duration = copy.deepcopy(n_originale.duration)
+                            copia_proprieta(n_originale, n_new)
+                            return n_new
 
-                                    for strum, note_ass in assegnazioni.items():
-                                        if not note_ass: continue
-                                        if len(note_ass) == 1: cassetti[strum][num].insert(off, note_ass[0])
-                                        else:
-                                            c = chord.Chord([n.pitch for n in note_ass])
-                                            c.duration = copy.deepcopy(note_ass[0].duration)
-                                            copia_proprieta(note_ass[0], c)
-                                            cassetti[strum][num].insert(off, c)
+                        def clona_parte(sorgente, destinazione):
+                            if sorgente in ensemble_attivo and destinazione in ensemble_attivo:
+                                for el in list(cassetti[destinazione][num].notes): cassetti[destinazione][num].remove(el)
+                                for el in cassetti[sorgente][num].notes:
+                                    if el.quarterLength > 0:
+                                        nuovo_el = forza_monofonia(el)
+                                        cassetti[destinazione][num].insert(float(el.offset), applica_limiti_fisici(nuovo_el, destinazione))
 
-                    # -- 3. ASSEMBLAGGIO FINALE E PULIZIA (Spazzatrice) --
-                    st.write("Applicazione Spazzatrice e frazionamento pause...")
+                        if len(strum_basso) > 1:
+                            basso_principale = strum_basso[0]
+                            for basso_sec in strum_basso[1:]: clona_parte(basso_principale, basso_sec)
+                                
+                        if len(strum_melodia) > 1:
+                            mel_principale = strum_melodia[0]
+                            for mel_sec in strum_melodia[1:]: clona_parte(mel_principale, mel_sec)
+
+                        for strum in ensemble_attivo:
+                            ruolo = user_config[strum]["ruolo"]
+                            fonte_dinamiche = m_dx_orig if ruolo == "Melodia" else m_sx_orig
+                            ha_dinamiche_sx = len(m_sx_orig.getElementsByClass(['Dynamic', 'TextExpression'])) > 0 if m_sx_orig else False
+                                
+                            if ruolo != "Melodia" and not ha_dinamiche_sx: fonte_dinamiche = m_dx_orig 
+                            applica_dinamiche_e_testi(fonte_dinamiche, cassetti[strum][num])
+
+                    # 3. Assemblaggio Finale
+                    st.write("Applicazione Spazzatrice e assemblaggio partitura...")
                     partitura_finale = stream.Score()
 
-                    nuovo_metadato = metadata.Metadata()
-                    titolo_estratto = None
-                    for tb in partitura_originale.getElementsByClass('TextBox'):
-                        if tb.content and not tb.content.endswith('.xml'):
-                            titolo_estratto = tb.content; break 
-                    if partitura_originale.metadata:
-                        nuovo_metadato.composer = partitura_originale.metadata.composer
-                        if not titolo_estratto:
-                            if partitura_originale.metadata.movementName: titolo_estratto = partitura_originale.metadata.movementName
-                            elif partitura_originale.metadata.title and not partitura_originale.metadata.title.endswith('.xml'): titolo_estratto = partitura_originale.metadata.title
-                    if titolo_estratto: nuovo_metadato.title = titolo_estratto
-                    partitura_finale.metadata = nuovo_metadato
+                    if partitura_originale.metadata is not None:
+                        partitura_finale.metadata = copy.deepcopy(partitura_originale.metadata)
+                    else:
+                        partitura_finale.metadata = metadata.Metadata()
 
-                    dati_strumenti = [
-                        ("Violino I", clef.TrebleClef(), instrument.Violin()),
-                        ("Violino II", clef.TrebleClef(), instrument.Violin()),
-                        ("Viola", clef.AltoClef(), instrument.Viola()),
-                        ("Violoncello", clef.BassClef(), instrument.Violoncello())
-                    ]
-
-                    for nome, clef_obj, inst_obj in dati_strumenti:
+                    for nome in ORDINE_PARTITURA:
+                        if nome not in ensemble_attivo: continue
+                        
                         p = stream.Part()
                         p.id = nome; p.partName = nome
-                        p.insert(0, inst_obj)
+                        p.insert(0, copy.deepcopy(LIBRERIA_STRUMENTI[nome]["inst"]))
                         
                         numeri_misure = sorted(cassetti[nome].keys())
                         for num in numeri_misure:
                             m = cassetti[nome][num]
                             m_orig_dx = parti_orig[0].measure(num)
-                            m_orig_sx = parti_orig[1].measure(num)
-                            if m_orig_dx:
-                                if hasattr(m_orig_dx, 'paddingLeft'): m.paddingLeft = m_orig_dx.paddingLeft
-                                if hasattr(m_orig_dx, 'paddingRight'): m.paddingRight = m_orig_dx.paddingRight
                             
                             if num == numeri_misure[0]:
-                                m.insert(0, copy.deepcopy(clef_obj))
+                                m.insert(0, copy.deepcopy(LIBRERIA_STRUMENTI[nome]["clef"]))
                                 if m_orig_dx:
                                     for ks in m_orig_dx.getElementsByClass(key.KeySignature): m.insert(ks.offset, copy.deepcopy(ks))
                                     for ts in m_orig_dx.getElementsByClass(meter.TimeSignature): m.insert(ts.offset, copy.deepcopy(ts))
                             
-                            if nome == "Violino I" and m_orig_dx:
+                            if nome == ensemble_attivo[0] and m_orig_dx:
                                 for t in m_orig_dx.getElementsByClass(['MetronomeMark', 'TextExpression']): m.insert(t.offset, copy.deepcopy(t))
-                            dinamiche_unite = {}
-                            if m_orig_dx:
-                                for d in m_orig_dx.getElementsByClass('Dynamic'): dinamiche_unite[d.offset] = d
-                            if m_orig_sx:
-                                for d in m_orig_sx.getElementsByClass('Dynamic'):
-                                    if d.offset not in dinamiche_unite: dinamiche_unite[d.offset] = d
-                            for off, d in dinamiche_unite.items(): m.insert(off, copy.deepcopy(d))
                             
-                            try:
-                                m.makeNotation(inPlace=True, bestClef=False)
+                            try: m.makeNotation(inPlace=True, bestClef=False)
                             except: pass
                             
-                            target_len = Fraction(0)
-                            if m_orig_dx: target_len = max(target_len, Fraction(m_orig_dx.quarterLength))
-                            if m_orig_sx: target_len = max(target_len, Fraction(m_orig_sx.quarterLength))
-                            if target_len == 0: target_len = Fraction(4) 
+                            target_len = Fraction(float(m_orig_dx.quarterLength)).limit_denominator(100) if m_orig_dx else Fraction(4) 
                             
                             occupati = []
                             for n in m.notes:
-                                if n.quarterLength > 0 and not getattr(n.duration, 'isGrace', False):
-                                    occupati.append([Fraction(n.offset), Fraction(n.offset) + Fraction(n.quarterLength)])
-                                    
-                            occupati.sort(key=lambda x: x[0])
+                                if n.quarterLength > 0:
+                                    start = Fraction(float(n.offset)).limit_denominator(100)
+                                    dur = Fraction(float(n.quarterLength)).limit_denominator(100)
+                                    occupati.append([start, start + dur])
+                            occupati.sort()
+                            
                             merged = []
-                            for start, end in occupati:
-                                if not merged:
-                                    merged.append([start, end])
-                                else:
-                                    last = merged[-1]
-                                    if start <= last[1]:
-                                        last[1] = max(last[1], end)
-                                    else:
-                                        merged.append([start, end])
+                            for s, e in occupati:
+                                if not merged or s > merged[-1][1]: merged.append([s, e])
+                                else: merged[-1][1] = max(merged[-1][1], e)
                                         
-                            current_time = Fraction(0)
-                            for start, end in merged:
-                                if start > current_time:
+                            curr = Fraction(0)
+                            for s, e in merged:
+                                if s > curr:
                                     r = note.Rest()
-                                    r.quarterLength = float(start - current_time)
+                                    r.quarterLength = float(s - curr) 
                                     r.style.hideObjectOnPrint = False 
-                                    m.insert(float(current_time), r)
-                                current_time = end
+                                    m.insert(float(curr), r)
+                                curr = e
                                 
-                            if current_time < target_len:
+                            if curr < target_len:
                                 r = note.Rest()
-                                r.quarterLength = float(target_len - current_time)
+                                r.quarterLength = float(target_len - curr)
                                 r.style.hideObjectOnPrint = False
-                                m.insert(float(current_time), r)
+                                m.insert(float(curr), r)
                                 
-                            # 🧹 SPAZZATRICE ASSOLUTA
                             if num != numeri_misure[0]:
                                 for ts in list(m.getElementsByClass(meter.TimeSignature)): m.remove(ts)
                                 for c in list(m.getElementsByClass(clef.Clef)): m.remove(c)
                                 
-                            p.append(m)
-                        partitura_finale.insert(0, p)
+                            p.append(m) 
+                        partitura_finale.append(p)
 
                     if KEEP_ORIGINAL:
                         st.write("Aggiunta del pianoforte originale...")
@@ -695,9 +634,9 @@ with col_main:
                             for m_ref in p_ref.getElementsByClass(stream.Measure):
                                 if m_ref.number != numeri_misure[0]:
                                     for ts in list(m_ref.getElementsByClass(meter.TimeSignature)): m_ref.remove(ts)
-                            partitura_finale.insert(0, p_ref)
+                            partitura_finale.append(p_ref)
 
-                    # -- 4. ESPORTAZIONE --
+                    # 4. Esportazione
                     out_path = tempfile.mktemp(suffix=".mxl")
                     partitura_finale.write('mxl', fp=out_path)
                     
@@ -705,9 +644,9 @@ with col_main:
                     
                     with open(out_path, "rb") as f:
                         st.download_button(
-                            label="📥 Scarica Spartito Orchestrato (.mxl)",
+                            label="📥 Scarica Partitura Orchestrata (.mxl)",
                             data=f,
-                            file_name="orchestrazione_ibrida.mxl",
+                            file_name="orchestrazione_modulare_v0_2.mxl",
                             mime="application/vnd.recordare.musicxml+xml"
                         )
                     
